@@ -925,8 +925,11 @@ def create_app(router: Optional[Any] = None):
     else:
         try:
             from .mcp import server as _mcp_mod
-        except ModuleNotFoundError as exc:
-            if exc.name != "mcp" and not (exc.name or "").startswith("mcp."):
+        except ImportError as exc:
+            # laya.mcp.server re-raises a missing `mcp` as a plain ImportError chained to the
+            # ModuleNotFoundError; anything else (a broken dependency) must not be swallowed.
+            missing = getattr(exc, "name", None) or getattr(exc.__cause__, "name", None) or ""
+            if missing != "mcp" and not missing.startswith("mcp."):
                 raise
             _log.warning("/mcp skipped: mcp package not importable (%s); pip install 'laya[serve,mcp]'", exc)
         else:
