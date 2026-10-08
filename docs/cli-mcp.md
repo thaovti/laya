@@ -307,6 +307,9 @@ laya-serve
   [HTTP API](http-api.md) for the route details.
 - The tools answer from the server's own Router, so `LAYA_BASE_URL` does not apply to them. Tool
   calls run on the server's single inference worker, one forward pass at a time.
+- `/mcp` enforces the 2 MiB body cap and admits at most `LAYA_MAX_CONCURRENT` concurrent tool calls
+  (a `busy` tool error when full), but not the per-field limits of `/v1/systemone` (state
+  characters, question count, token budget).
 - The binding of tools to the server's Router is process-wide and the last bind wins. Embedding two
   live apps in one process makes the MCP tools of both use the Router of the last-created app.
 - With `LAYA_HOST` set to `127.0.0.1`, `localhost` or `::1`, the MCP SDK's DNS-rebinding protection

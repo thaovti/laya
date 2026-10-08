@@ -291,6 +291,11 @@ Successful responses also carry `Server-Timing: inference;dur=<ms>` and `X-Infer
 Tool calls run on the same single inference worker as `POST /v1/systemone`, so they queue behind a
 running forward pass and count as activity for `LAYA_IDLE_UNLOAD_SECONDS`.
 
+`/mcp` enforces the same 2 MiB request body cap as the other routes (larger bodies get `413`) and a
+non-blocking admission budget of `LAYA_MAX_CONCURRENT` concurrent tool calls: when it is full, a tool
+call returns a `busy` tool error instead of queueing. It does not apply the per-field limits of
+`/v1/systemone` (state characters, question count, token budget).
+
 ## Limits
 
 Request guardrails are checked before tokenization, so an oversized request costs the server
