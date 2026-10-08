@@ -6,6 +6,7 @@ Laya has two local interfaces for trying the same structured-decision engine:
 |---|---|---|
 | `laya` | quick checks and interactive exploration from a terminal | command line |
 | `laya-mcp-server` | connecting an MCP client or agent to Laya's built-in tools | MCP over stdio |
+| `laya-serve` (`/mcp`) | one shared server for several MCP clients | MCP over Streamable HTTP |
 
 Choose the CLI when you are the person reading the result. Choose MCP when another process needs
 a stable tool interface. Both use Laya's `Router` to select a checkpoint and return typed
@@ -134,7 +135,8 @@ laya-mcp-server
 python -m laya.mcp.server
 ```
 
-The server speaks MCP over **stdio**, not HTTP. Configure the client with the console script:
+The server speaks MCP over **stdio** via `laya-mcp-server`; `laya-serve` also speaks Streamable HTTP
+at `/mcp` (see [MCP over HTTP](#mcp-over-http-on-laya-serve)). Configure a stdio client with the console script:
 
 ```json
 {
@@ -242,6 +244,7 @@ the server is ready.
 | `LAYA_DEFAULT_MODEL` | `multilingual` | The checkpoint a state with no language evidence falls back to, same meaning as in `laya.serve`. Unlike `laya.serve`, an unresolvable name does not stop the server: it comes back as a `router construction failed` tool error on the next call, because a stdio server has no startup to refuse. |
 | `LAYA_BASE_URL` | unset | Send predictions to a `laya-serve` on your own hardware instead of loading checkpoints in each MCP process. A bare `host:port` is read as HTTP. |
 | `LAYA_REMOTE_TIMEOUT` | `300` | HTTP timeout in seconds when `LAYA_BASE_URL` is set, including the server's cold load. Invalid or non-positive values use the default. |
+| `LAYA_MCP` | `1` | `laya-serve` only. `0` removes `/mcp` from `laya-serve`; the mounted tools answer from the server's own Router, so `LAYA_BASE_URL` does not apply to them. |
 
 ### Share one model server across MCP sessions
 
@@ -285,6 +288,33 @@ shared-server mode. A custom launcher can use `laya.hooks.set_default_hooks` bef
 above configure model lifecycle, not hook registration. The client still decides when to call a
 tool and what to do with the returned decision.
 
+### MCP over HTTP on `laya-serve`
+
+`laya-serve` mounts the same tools at `/mcp` over Streamable HTTP, so several clients share one
+resident Router instead of each spawning a stdio process:
+
+```bash
+python -m pip install "laya[serve,mcp]"
+laya-serve
+```
+
+```json
+{"mcpServers": {"laya": {"url": "http://127.0.0.1:8000/mcp", "headers": {"Authorization": "Bearer <LAYA_API_KEY>"}}}}
+```
+
+- The endpoint is on by default when the `mcp` package imports; `LAYA_MCP=0` disables it. Without
+  `LAYA_API_KEY` it is open, like the other routes. It honors `LAYA_ROOT_PATH`. See
+  [HTTP API](http-api.md) for the route details.
+- The tools answer from the server's own Router, so `LAYA_BASE_URL` does not apply to them. Tool
+  calls run on the server's single inference worker, one forward pass at a time.
+- `/mcp` enforces the 2 MiB body cap and admits at most `LAYA_MAX_CONCURRENT` concurrent tool calls
+  (a `busy` tool error when full), but not the per-field limits of `/v1/systemone` (state
+  characters, question count, token budget).
+- The binding of tools to the server's Router is process-wide and the last bind wins. Embedding two
+  live apps in one process makes the MCP tools of both use the Router of the last-created app.
+- With `LAYA_HOST` set to `127.0.0.1`, `localhost` or `::1`, the MCP SDK's DNS-rebinding protection
+  applies to `/mcp` and other `Host` headers are rejected. The default `0.0.0.0` has none.
+
 ## 3. Shared boundaries and related guides
 
 The CLI and MCP server are interfaces to the same typed decision engine:
@@ -298,5 +328,6 @@ The CLI and MCP server are interfaces to the same typed decision engine:
   [Prediction hooks](hooks/index.md), [hook lifecycle](hooks/lifecycle.md), and
   [Tracing](hooks/tracing.md) for observability and `run_id` correlation.
 
-This guide covers the local CLI and the built-in MCP stdio server. It does not document the
-HTTP API, community wrappers, or an MCP protocol redesign.
+This guide covers the local CLI, the built-in MCP stdio server, and the `/mcp` Streamable HTTP
+endpoint on `laya-serve`. It does not document the rest of the HTTP API (see [HTTP API](http-api.md)),
+community wrappers, or an MCP protocol redesign.

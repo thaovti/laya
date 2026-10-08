@@ -452,7 +452,7 @@ import sys
 class Blocker:
     def find_spec(self, name, path=None, target=None):
         if name == "mcp" or name.startswith("mcp."):
-            raise ImportError("mcp blocked")
+            raise ModuleNotFoundError("mcp blocked", name=name)
 sys.meta_path.insert(0, Blocker())
 sys.path.insert(0, %r)
 from laya.mcp.device import agent_device, env_device, resolve_device, router_agent

@@ -275,6 +275,27 @@ stringifies its own criteria may not match byte for byte.
 
 Successful responses also carry `Server-Timing: inference;dur=<ms>` and `X-Inference-Time-Ms`.
 
+### `/mcp`
+
+`laya-serve` also answers MCP over Streamable HTTP at `/mcp`, with the same tools as
+`laya-mcp-server` (see [Command line and MCP server](cli-mcp.md)).
+
+| | |
+|---|---|
+| Path and methods | `/mcp`; `GET`, `POST`, `DELETE` |
+| Auth | The same bearer check as the other routes: with `LAYA_API_KEY` set, a missing or wrong `Authorization: Bearer <key>` gets `401`; with no key set the route is open |
+| Root path | Served inside the app, so `LAYA_ROOT_PATH` applies as it does to every other route |
+| Availability | On by default. Needs `pip install "laya[serve,mcp]"`; with the `mcp` package missing the route is absent (plain `404`) and startup logs why. `LAYA_MCP=0` removes it |
+| Host header | With `LAYA_HOST` set to `127.0.0.1`, `localhost` or `::1`, the MCP SDK's DNS-rebinding protection applies to `/mcp` and other `Host` headers are rejected. The default `0.0.0.0` has no such check |
+
+Tool calls run on the same single inference worker as `POST /v1/systemone`, so they queue behind a
+running forward pass and count as activity for `LAYA_IDLE_UNLOAD_SECONDS`.
+
+`/mcp` enforces the same 2 MiB request body cap as the other routes (larger bodies get `413`) and a
+non-blocking admission budget of `LAYA_MAX_CONCURRENT` concurrent tool calls: when it is full, a tool
+call returns a `busy` tool error instead of queueing. It does not apply the per-field limits of
+`/v1/systemone` (state characters, question count, token budget).
+
 ## Limits
 
 Request guardrails are checked before tokenization, so an oversized request costs the server

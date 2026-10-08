@@ -70,6 +70,22 @@ server = MCPServer("laya", version=_LAYA_VERSION)
 
 _ROUTER: Any = None
 _ROUTER_LOCK = threading.Lock()
+# Set by `bind_router` when the tools are mounted inside laya-serve: every tool call goes through
+# it so MCP work queues on the server's single inference worker. None (stdio) calls directly.
+_RUN: Any = None
+
+
+def bind_router(router: Any, run: Any = None) -> None:
+    """Make the tools answer from ``router`` (laya-serve's own) instead of building one from env.
+
+    ``run(fn)`` executes a zero-argument callable and returns its result; laya-serve passes its
+    inference-worker hop so an MCP call and a ``/v1/systemone`` call never overlap. Process-wide:
+    the last bind wins.
+    """
+    global _ROUTER, _RUN
+    with _ROUTER_LOCK:
+        _ROUTER = router
+        _RUN = run
 
 # MCP default preload list. laya.serve preloads every checkpoint when LAYA_MODELS
 # is empty; MCP keeps typed-decisions lazy on purpose (it is ~as big as the other
@@ -220,7 +236,10 @@ def _wrap(fn, **kwargs) -> str:
     mcp.server.mcpserver.exceptions.ToolError keeps our JSON on the wire.
     """
     try:
-        return _dump(fn(**kwargs))
+        run = _RUN
+        if run is None:
+            return _dump(fn(**kwargs))
+        return _dump(run(lambda: fn(**kwargs)))
     except ToolError as exc:
         raise McpToolError(_dump({"error": exc.code, "message": exc.message})) from exc
     except McpToolError:

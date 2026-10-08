@@ -58,6 +58,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -912,6 +913,50 @@ def create_app(router: Optional[Any] = None):
             # pass continues after the event loop releases the gate.
             _mark_request()
 
+    # `/mcp`: the MCP tools mounted on this app. Optional (`laya[mcp]`) and on by default; a
+    # missing package is a log line, never a startup failure.
+    mcp_server = None
+    mcp_manager = None
+    mcp_http_app = None
+    mcp_run = None
+    _mcp_mod = None
+    if not _env_bool("LAYA_MCP", True):
+        _log.info("/mcp disabled by LAYA_MCP")
+    else:
+        try:
+            from .mcp import server as _mcp_mod
+        except ImportError as exc:
+            # laya.mcp.server re-raises a missing `mcp` as a plain ImportError chained to the
+            # ModuleNotFoundError; anything else (a broken dependency) must not be swallowed.
+            missing = getattr(exc, "name", None) or getattr(exc.__cause__, "name", None) or ""
+            if missing != "mcp" and not missing.startswith("mcp."):
+                raise
+            _log.warning("/mcp skipped: mcp package not importable (%s); pip install 'laya[serve,mcp]'", exc)
+        else:
+            from .mcp.tools import ToolError
+
+            # Non-blocking admission, like the HTTP routes' budget: a full house answers "busy"
+            # instead of parking another anyio thread in `.result()` behind the single worker.
+            mcp_slots = threading.BoundedSemaphore(max_concurrent)
+
+            def mcp_run(fn):
+                if not mcp_slots.acquire(blocking=False):
+                    raise ToolError("busy", "server busy, try again later")
+                try:
+                    return pool.submit(_run_inference, fn).result()
+                finally:
+                    mcp_slots.release()
+
+            _mcp_mod.bind_router(router, run=mcp_run)
+            mcp_server = _mcp_mod.server
+            # A fresh ASGI app (and session manager) per create_app: the manager is single-use.
+            mcp_http_app = mcp_server.streamable_http_app(
+                streamable_http_path="/mcp", host=os.environ.get("LAYA_HOST", "0.0.0.0"),
+                max_request_body_size=MAX_BODY_BYTES)
+            # Capture now: the next create_app() overwrites the singleton's `session_manager`.
+            mcp_manager = mcp_server.session_manager
+            _log.info("/mcp enabled")
+
     def _unload_if_idle():
         # Recheck on the inference worker: a queued unload must see any forward pass that
         # finished after the reaper checked the gate. Unload and inference never overlap.
@@ -936,8 +981,15 @@ def create_app(router: Optional[Any] = None):
     async def lifespan(_app: FastAPI):
         reaper = asyncio.create_task(_idle_reaper()) if idle_unload_seconds else None
         try:
-            yield
+            if mcp_manager is None:
+                yield
+            else:
+                async with mcp_manager.run():
+                    yield
         finally:
+            # Unbind only if no later create_app() has replaced this app's hook.
+            if mcp_run is not None and _mcp_mod._RUN is mcp_run:
+                _mcp_mod.bind_router(None, None)
             if reaper is not None:
                 reaper.cancel()
                 try:
@@ -974,6 +1026,25 @@ def create_app(router: Optional[Any] = None):
     def _check_auth(authorization: Optional[str]) -> None:
         if not _authorized(authorization):
             raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+    if mcp_http_app is not None:
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+
+        class _McpEndpoint:
+            """ASGI endpoint for /mcp. An object, not a function: Starlette treats a plain
+            function passed to Route as a request handler."""
+
+            async def __call__(self, scope, receive, send):
+                if scope["type"] == "http":
+                    raw = dict(scope["headers"]).get(b"authorization")
+                    if not _authorized(raw.decode("latin-1") if raw is not None else None):
+                        resp = JSONResponse({"detail": "invalid or missing bearer token"}, status_code=401)
+                        await resp(scope, receive, send)
+                        return
+                await mcp_http_app(scope, receive, send)
+
+        app.router.routes.append(Route("/mcp", endpoint=_McpEndpoint(), methods=["GET", "POST", "DELETE"]))
 
     @app.get("/health")
     def health(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
