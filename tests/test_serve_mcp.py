@@ -167,3 +167,21 @@ def test_mcp_answers_under_root_path(monkeypatch):
     monkeypatch.setenv("LAYA_ROOT_PATH", "/laya")
     with TestClient(create_app(Router()), root_path="/laya") as client:
         assert McpSession(client).call("tools/list")["result"]["tools"]
+
+
+def test_mcp_tool_runs_on_inference_worker_and_marks_activity(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    threads = []
+    router = Router()
+    real_route = router.route
+
+    def spy(*a, **k):
+        threads.append(threading.current_thread().name)
+        return real_route(*a, **k)
+
+    monkeypatch.setattr(router, "route", spy)
+    with TestClient(create_app(router)) as client:
+        s = McpSession(client)
+        res = s.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
+        assert not res.get("isError")
+    assert threads and all(t.startswith("laya-infer") for t in threads), threads
