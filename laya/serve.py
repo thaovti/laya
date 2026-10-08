@@ -915,6 +915,7 @@ def create_app(router: Optional[Any] = None):
     # `/mcp`: the MCP tools mounted on this app. Optional (`laya[mcp]`) and on by default; a
     # missing package is a log line, never a startup failure.
     mcp_server = None
+    mcp_manager = None
     mcp_http_app = None
     if not _env_bool("LAYA_MCP", True):
         _log.info("/mcp disabled by LAYA_MCP")
@@ -929,6 +930,8 @@ def create_app(router: Optional[Any] = None):
             # A fresh ASGI app (and session manager) per create_app: the manager is single-use.
             mcp_http_app = mcp_server.streamable_http_app(
                 streamable_http_path="/mcp", host=os.environ.get("LAYA_HOST", "0.0.0.0"))
+            # Capture now: the next create_app() overwrites the singleton's `session_manager`.
+            mcp_manager = mcp_server.session_manager
             _log.info("/mcp enabled")
 
     def _unload_if_idle():
@@ -955,10 +958,10 @@ def create_app(router: Optional[Any] = None):
     async def lifespan(_app: FastAPI):
         reaper = asyncio.create_task(_idle_reaper()) if idle_unload_seconds else None
         try:
-            if mcp_server is None:
+            if mcp_manager is None:
                 yield
             else:
-                async with mcp_server.session_manager.run():
+                async with mcp_manager.run():
                     yield
         finally:
             if reaper is not None:

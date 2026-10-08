@@ -135,9 +135,11 @@ def test_mcp_skipped_when_package_missing(monkeypatch, caplog):
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    with caplog.at_level("INFO"):
-        app = create_app(Router())
-    monkeypatch.setattr(builtins, "__import__", real_import)
+    try:
+        with caplog.at_level("INFO"):
+            app = create_app(Router())
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
     with TestClient(app) as client:
         assert client.post("/mcp", json={}, headers=HDR).status_code == 404
     assert any("/mcp skipped" in r.getMessage() for r in caplog.records)
@@ -147,6 +149,16 @@ def test_two_apps_in_one_process_both_serve_mcp(monkeypatch):
     monkeypatch.delenv("LAYA_API_KEY", raising=False)
     for _ in range(2):
         with TestClient(create_app(Router())) as client:
+            assert McpSession(client).call("tools/list")["result"]["tools"]
+
+
+def test_coexisting_apps_each_start_their_own_session_manager(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    a = create_app(Router())
+    b = create_app(Router())
+    # tools/list only: bind_router is process-wide, so tool calls would run through b's router
+    for app in (a, b):
+        with TestClient(app) as client:
             assert McpSession(client).call("tools/list")["result"]["tools"]
 
 
