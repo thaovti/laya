@@ -82,7 +82,8 @@ def test_mcp_lists_tools_and_shares_router(monkeypatch):
     with TestClient(create_app(router)) as client:
         s = McpSession(client)
         names = {t["name"] for t in s.call("tools/list")["result"]["tools"]}
-        assert {"laya_status", "laya_route", "laya_predict", "laya_decide"} <= names
+        assert names == {"laya_status", "laya_route", "laya_predict", "laya_predict_batch",
+                         "laya_route_batch", "laya_shortlist", "laya_preset", "laya_decide"}
         assert mcp_server._ROUTER is router
         res = s.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
         assert not res.get("isError")
@@ -120,6 +121,10 @@ def test_mcp_disabled_by_env(monkeypatch):
     with TestClient(create_app(Router())) as client:
         assert client.post("/mcp", json={}, headers=HDR).status_code == 404
         assert client.get("/health").status_code == 200
+        # the HTTP surface is untouched: a valid request still reaches the router
+        res = client.post("/v1/systemone", json={"state": {"body": "hi"}, "questions": {
+            "q": {"type": "choice", "instructions": "pick", "criteria": {"a": None, "b": None}}}})
+        assert res.status_code != 404, res.text
 
 
 def test_mcp_skipped_when_package_missing(monkeypatch, caplog):
@@ -131,7 +136,7 @@ def test_mcp_skipped_when_package_missing(monkeypatch, caplog):
 
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if level == 1 and name == "mcp" and "server" in (fromlist or ()):
-            raise ImportError("No module named 'mcp'")
+            raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
@@ -142,7 +147,26 @@ def test_mcp_skipped_when_package_missing(monkeypatch, caplog):
         monkeypatch.setattr(builtins, "__import__", real_import)
     with TestClient(app) as client:
         assert client.post("/mcp", json={}, headers=HDR).status_code == 404
-    assert any("/mcp skipped" in r.getMessage() for r in caplog.records)
+    assert any("/mcp skipped" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_other_import_errors_propagate_from_create_app(monkeypatch):
+    import builtins
+
+    monkeypatch.delenv("LAYA_MCP", raising=False)
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 1 and name == "mcp" and "server" in (fromlist or ()):
+            raise ModuleNotFoundError("No module named 'other_dep'", name="other_dep")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    try:
+        with pytest.raises(ImportError, match="other_dep"):
+            create_app(Router())
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
 
 
 def test_two_apps_in_one_process_both_serve_mcp(monkeypatch):
@@ -169,7 +193,7 @@ def test_mcp_answers_under_root_path(monkeypatch):
         assert McpSession(client).call("tools/list")["result"]["tools"]
 
 
-def test_mcp_tool_runs_on_inference_worker_and_marks_activity(monkeypatch):
+def test_mcp_tool_runs_on_inference_worker(monkeypatch):
     monkeypatch.delenv("LAYA_API_KEY", raising=False)
     threads = []
     router = Router()
@@ -185,3 +209,79 @@ def test_mcp_tool_runs_on_inference_worker_and_marks_activity(monkeypatch):
         res = s.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
         assert not res.get("isError")
     assert threads and all(t.startswith("laya-infer") for t in threads), threads
+
+
+def test_mcp_tool_call_marks_activity_for_idle_unload(monkeypatch):
+    import time
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "1000")
+    with TestClient(create_app(Router())) as client:
+        s = McpSession(client)
+        time.sleep(0.4)
+        assert client.get("/health").json()["idle_seconds"] >= 0.3
+        res = s.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
+        assert not res.get("isError")
+        assert client.get("/health").json()["idle_seconds"] < 0.3
+
+
+def test_mcp_busy_when_admission_budget_is_full(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.setenv("LAYA_MAX_CONCURRENT", "1")
+    router = Router()
+    entered, release = threading.Event(), threading.Event()
+    real_route = router.route
+
+    def slow(*a, **k):
+        entered.set()
+        assert release.wait(10)
+        return real_route(*a, **k)
+
+    monkeypatch.setattr(router, "route", slow)
+    out = {}
+    with TestClient(create_app(router)) as client:
+        s1, s2 = McpSession(client), McpSession(client)
+
+        def first():
+            out["first"] = s1.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
+
+        t = threading.Thread(target=first)
+        t.start()
+        try:
+            assert entered.wait(10)
+            res = s2.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
+            assert res["isError"] is True
+            assert json.loads(res["content"][0]["text"].split(": ", 1)[1])["error"] == "busy"
+        finally:
+            release.set()
+            t.join(10)
+        assert not out["first"].get("isError")
+        # the slot is released: a later call is admitted again
+        again = s2.call("tools/call", {"name": "laya_route", "arguments": ROUTE_ARGS})["result"]
+        assert not again.get("isError")
+
+
+def test_mcp_rejects_oversized_body(monkeypatch):
+    from laya.serve import MAX_BODY_BYTES
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    with TestClient(create_app(Router())) as client:
+        s = McpSession(client)
+        pad = "x" * (MAX_BODY_BYTES + 1)
+        r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {"p": pad}},
+                        headers=s.h)
+        assert r.status_code == 413, (r.status_code, r.text[:200])
+
+
+def test_shutdown_unbinds_only_its_own_hook(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    with TestClient(create_app(Router())):
+        assert mcp_server._RUN is not None
+    assert mcp_server._RUN is None and mcp_server._ROUTER is None
+
+    a = create_app(Router())
+    with TestClient(a):
+        b = create_app(Router())
+        hook_b = mcp_server._RUN
+    assert mcp_server._RUN is hook_b and hook_b is not None
+    del b

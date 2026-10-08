@@ -58,6 +58,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -917,19 +918,38 @@ def create_app(router: Optional[Any] = None):
     mcp_server = None
     mcp_manager = None
     mcp_http_app = None
+    mcp_run = None
+    _mcp_mod = None
     if not _env_bool("LAYA_MCP", True):
         _log.info("/mcp disabled by LAYA_MCP")
     else:
         try:
             from .mcp import server as _mcp_mod
-        except ImportError as exc:
-            _log.info("/mcp skipped: mcp package not importable (%s); pip install 'laya[serve,mcp]'", exc)
+        except ModuleNotFoundError as exc:
+            if exc.name != "mcp" and not (exc.name or "").startswith("mcp."):
+                raise
+            _log.warning("/mcp skipped: mcp package not importable (%s); pip install 'laya[serve,mcp]'", exc)
         else:
-            _mcp_mod.bind_router(router, run=lambda fn: pool.submit(_run_inference, fn).result())
+            from .mcp.tools import ToolError
+
+            # Non-blocking admission, like the HTTP routes' budget: a full house answers "busy"
+            # instead of parking another anyio thread in `.result()` behind the single worker.
+            mcp_slots = threading.BoundedSemaphore(max_concurrent)
+
+            def mcp_run(fn):
+                if not mcp_slots.acquire(blocking=False):
+                    raise ToolError("busy", "server busy, try again later")
+                try:
+                    return pool.submit(_run_inference, fn).result()
+                finally:
+                    mcp_slots.release()
+
+            _mcp_mod.bind_router(router, run=mcp_run)
             mcp_server = _mcp_mod.server
             # A fresh ASGI app (and session manager) per create_app: the manager is single-use.
             mcp_http_app = mcp_server.streamable_http_app(
-                streamable_http_path="/mcp", host=os.environ.get("LAYA_HOST", "0.0.0.0"))
+                streamable_http_path="/mcp", host=os.environ.get("LAYA_HOST", "0.0.0.0"),
+                max_request_body_size=MAX_BODY_BYTES)
             # Capture now: the next create_app() overwrites the singleton's `session_manager`.
             mcp_manager = mcp_server.session_manager
             _log.info("/mcp enabled")
@@ -964,6 +984,9 @@ def create_app(router: Optional[Any] = None):
                 async with mcp_manager.run():
                     yield
         finally:
+            # Unbind only if no later create_app() has replaced this app's hook.
+            if mcp_run is not None and _mcp_mod._RUN is mcp_run:
+                _mcp_mod.bind_router(None, None)
             if reaper is not None:
                 reaper.cancel()
                 try:
